@@ -36,7 +36,9 @@ target_include_directories(usb2tft PRIVATE
 
 target_link_libraries(usb2tft
     pico_stdlib
+    pico_bootrom
     hardware_spi
+    hardware_dma
     tinyusb_device
     tinyusb_board
 )

@@ -1,5 +1,8 @@
+
 #include "pico/stdlib.h"
+#include "pico/bootrom.h"
 #include "hardware/spi.h"
+#include "hardware/dma.h"
 #include "tusb.h"
 #include "bsp/board_api.h"
 
@@ -13,6 +16,12 @@
 #define PIN_RST   0   // confirmed working
 
 #define SPI_PORT  spi0
+
+// The RP2040 divides its 125 MHz peripheral clock, so the reachable rates are
+// 125/2, 125/4, 125/6 ... MHz.  31.25 MHz sends a full frame in 8.4 ms, which
+// keeps the panel well ahead of the USB link.  Drop to 15625000 (125/8) if long
+// or unshielded wiring produces speckled pixels.
+#define SPI_HZ    31250000
 
 // --- ST7735 commands ---
 #define ST77XX_SWRESET  0x01
@@ -46,6 +55,7 @@
 // USB frame protocol:
 //   54 46 54 31  00 00 80 00  [32,768 RGB565 bytes, big-endian]
 //       "TFT1"       payload length
+// One 'K' byte is sent back per displayed frame so the host can pace itself.
 static const uint8_t frame_header[] = {
     'T', 'F', 'T', '1',
     (FRAME_BYTES >> 24) & 0xff,
@@ -54,9 +64,16 @@ static const uint8_t frame_header[] = {
     FRAME_BYTES & 0xff,
 };
 
-// The RP2040's default main stack is far smaller than a full framebuffer.
-// Keep the receive buffer in static RAM instead.
-static uint8_t receive_frame[FRAME_BYTES];
+#define FRAME_ACK 'K'
+
+// Two framebuffers: USB fills one while DMA streams the other to the panel.
+// The RP2040's default main stack is far smaller than a single framebuffer, so
+// these must live in static RAM.
+static uint8_t frame_buf[2][FRAME_BYTES];
+
+static int dma_chan = -1;
+static bool dma_busy = false;
+static bool ack_pending = false;
 
 // --- Hardware SPI ---
 static inline void cs_low()  { gpio_put(PIN_CS, 0); }
@@ -82,9 +99,7 @@ static inline void st_data16(uint16_t d) { spi_write16(d); }
 
 // --- GPIO init ---
 static void gpio_init_all(void) {
-    // ST7735S accepts a much faster clock, but keep this conservative for
-    // breadboard/flex-cable wiring while bringing the panel up.
-    spi_init(SPI_PORT, 8000000);
+    spi_init(SPI_PORT, SPI_HZ);
     spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(PIN_SCK,  GPIO_FUNC_SPI);
@@ -94,26 +109,66 @@ static void gpio_init_all(void) {
     gpio_init(PIN_RST); gpio_set_dir(PIN_RST, GPIO_OUT); gpio_put(PIN_RST, 1);
 }
 
-static void bare_fill(uint16_t color) {
-    cs_low();
-    st_cmd(ST77XX_CASET);
-    st_data8(0); st_data8(0); st_data8(0); st_data8(127);
-    st_cmd(ST77XX_RASET);
-    st_data8(0); st_data8(0); st_data8(0); st_data8(127);
-    st_cmd(ST77XX_RAMWR);
-    for (uint32_t i = 0; i < TFT_WIDTH * TFT_HEIGHT; i++) st_data16(color);
-    cs_high();
-}
-
-static void display_frame(const uint8_t *pixels) {
-    cs_low();
+static void set_full_window(void) {
     st_cmd(ST77XX_CASET);
     st_data8(0); st_data8(0); st_data8(0); st_data8(TFT_WIDTH - 1);
     st_cmd(ST77XX_RASET);
     st_data8(0); st_data8(0); st_data8(0); st_data8(TFT_HEIGHT - 1);
     st_cmd(ST77XX_RAMWR);
-    spi_write_blocking(SPI_PORT, pixels, FRAME_BYTES);
+}
+
+static void bare_fill(uint16_t color) {
+    cs_low();
+    set_full_window();
+    for (uint32_t i = 0; i < TFT_WIDTH * TFT_HEIGHT; i++) st_data16(color);
     cs_high();
+}
+
+// Hand a completed framebuffer to DMA and return immediately.  CS stays
+// asserted for the whole transfer and is released in display_poll().
+static void display_start(const uint8_t *pixels) {
+    cs_low();
+    set_full_window();
+
+    dma_channel_config cfg = dma_channel_get_default_config(dma_chan);
+    channel_config_set_transfer_data_size(&cfg, DMA_SIZE_8);
+    channel_config_set_read_increment(&cfg, true);
+    channel_config_set_write_increment(&cfg, false);
+    channel_config_set_dreq(&cfg, spi_get_dreq(SPI_PORT, true));
+
+    dma_channel_configure(dma_chan, &cfg,
+                          &spi_get_hw(SPI_PORT)->dr,  // write to the SPI data register
+                          pixels,                     // read from the framebuffer
+                          FRAME_BYTES,
+                          true);                      // start now
+    dma_busy = true;
+}
+
+static void display_poll(void) {
+    if (!dma_busy || dma_channel_is_busy(dma_chan)) return;
+
+    // DMA has queued the last byte; the SPI FIFO still has to shift it out
+    // before CS may be released.
+    while (spi_is_busy(SPI_PORT)) tight_loop_contents();
+    cs_high();
+    dma_busy = false;
+    ack_pending = true;
+}
+
+static void service_ack(void) {
+    if (!ack_pending || tud_cdc_write_available() == 0) return;
+    tud_cdc_write_char(FRAME_ACK);
+    tud_cdc_write_flush();
+    ack_pending = false;
+}
+
+// Opening the port at 1200 baud reboots into BOOTSEL, the same convention the
+// Pico's stdio driver and Arduino use.  Reflashing then needs no button press.
+#define RESET_MAGIC_BAUD 1200
+
+void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const *coding) {
+    (void) itf;
+    if (coding->bit_rate == RESET_MAGIC_BAUD) reset_usb_boot(0, 0);
 }
 
 static void st7735_init(void) {
@@ -149,9 +204,10 @@ static void st7735_init(void) {
 }
 
 int main(void) {
-    // Use TinyUSB's standard RP2040 board/device startup sequence.
+    // Use TinyUSB's standard RP2040 board/device startup sequence.  No
+    // stdio_init_all(): nothing here prints, and the default UART would
+    // otherwise claim GP0, which drives the panel's reset line.
     board_init();
-    stdio_init_all();
     gpio_init_all();
 
     gpio_put(PIN_RST, 0); sleep_ms(50);
@@ -159,6 +215,8 @@ int main(void) {
 
     st7735_init();
     bare_fill(0x0000);
+
+    dma_chan = dma_claim_unused_channel(true);
 
     tusb_rhport_init_t usb_init = {
         .role = TUSB_ROLE_DEVICE,
@@ -168,15 +226,17 @@ int main(void) {
 
     uint8_t header_matched = 0;
     uint32_t frame_pos = 0;
+    uint8_t fill_index = 0;
 
     while (true) {
         tud_task();
+        display_poll();
+        service_ack();
 
         while (tud_cdc_available()) {
-            uint8_t byte;
-            tud_cdc_read(&byte, 1);
-
             if (header_matched < sizeof(frame_header)) {
+                uint8_t byte;
+                tud_cdc_read(&byte, 1);
                 if (byte == frame_header[header_matched]) {
                     header_matched++;
                 } else {
@@ -186,9 +246,22 @@ int main(void) {
                 continue;
             }
 
-            receive_frame[frame_pos++] = byte;
+            // Bulk-copy whatever has arrived straight into the framebuffer.
+            uint32_t got = tud_cdc_read(&frame_buf[fill_index][frame_pos],
+                                       FRAME_BYTES - frame_pos);
+            if (got == 0) break;
+            frame_pos += got;
+
             if (frame_pos == FRAME_BYTES) {
-                display_frame(receive_frame);
+                // The previous frame is normally long gone (8.4 ms of DMA
+                // against ~28 ms of USB), but never overwrite a buffer that
+                // is still being shifted out.
+                while (dma_busy) {
+                    tud_task();
+                    display_poll();
+                }
+                display_start(frame_buf[fill_index]);
+                fill_index ^= 1;
                 frame_pos = 0;
                 header_matched = 0;
             }

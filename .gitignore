@@ -1,0 +1,11 @@
+# Pico SDK / CMake build output
+/build/
+
+# Editor settings and workspace files
+/.vscode/
+
+# Temporary files
+*.swp
+*~
+.DS_Store
+

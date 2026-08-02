@@ -1,5 +1,7 @@
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
+#include "tusb.h"
+#include "bsp/board_api.h"
 
 // --- Pin definitions ---
 // GP3 dead, GP6 was bit-bang MOSI → now using hardware SPI0
@@ -39,6 +41,22 @@
 
 #define TFT_WIDTH   128
 #define TFT_HEIGHT  128
+#define FRAME_BYTES (TFT_WIDTH * TFT_HEIGHT * 2)
+
+// USB frame protocol:
+//   54 46 54 31  00 00 80 00  [32,768 RGB565 bytes, big-endian]
+//       "TFT1"       payload length
+static const uint8_t frame_header[] = {
+    'T', 'F', 'T', '1',
+    (FRAME_BYTES >> 24) & 0xff,
+    (FRAME_BYTES >> 16) & 0xff,
+    (FRAME_BYTES >> 8) & 0xff,
+    FRAME_BYTES & 0xff,
+};
+
+// The RP2040's default main stack is far smaller than a full framebuffer.
+// Keep the receive buffer in static RAM instead.
+static uint8_t receive_frame[FRAME_BYTES];
 
 // --- Hardware SPI ---
 static inline void cs_low()  { gpio_put(PIN_CS, 0); }
@@ -87,6 +105,17 @@ static void bare_fill(uint16_t color) {
     cs_high();
 }
 
+static void display_frame(const uint8_t *pixels) {
+    cs_low();
+    st_cmd(ST77XX_CASET);
+    st_data8(0); st_data8(0); st_data8(0); st_data8(TFT_WIDTH - 1);
+    st_cmd(ST77XX_RASET);
+    st_data8(0); st_data8(0); st_data8(0); st_data8(TFT_HEIGHT - 1);
+    st_cmd(ST77XX_RAMWR);
+    spi_write_blocking(SPI_PORT, pixels, FRAME_BYTES);
+    cs_high();
+}
+
 static void st7735_init(void) {
     // CS is active LOW on the ST7735S.  Keep it asserted for the complete
     // command sequence, then deassert it between transactions.
@@ -120,6 +149,8 @@ static void st7735_init(void) {
 }
 
 int main(void) {
+    // Use TinyUSB's standard RP2040 board/device startup sequence.
+    board_init();
     stdio_init_all();
     gpio_init_all();
 
@@ -127,10 +158,40 @@ int main(void) {
     gpio_put(PIN_RST, 1); sleep_ms(150);
 
     st7735_init();
+    bare_fill(0x0000);
+
+    tusb_rhport_init_t usb_init = {
+        .role = TUSB_ROLE_DEVICE,
+        .speed = TUSB_SPEED_AUTO,
+    };
+    tusb_init(0, &usb_init); // RP2040's built-in USB controller
+
+    uint8_t header_matched = 0;
+    uint32_t frame_pos = 0;
 
     while (true) {
-        bare_fill(0xF800); sleep_ms(1000); // red
-        bare_fill(0x07E0); sleep_ms(1000); // green
-        bare_fill(0x001F); sleep_ms(1000); // blue
+        tud_task();
+
+        while (tud_cdc_available()) {
+            uint8_t byte;
+            tud_cdc_read(&byte, 1);
+
+            if (header_matched < sizeof(frame_header)) {
+                if (byte == frame_header[header_matched]) {
+                    header_matched++;
+                } else {
+                    // The first header byte can also begin a new header.
+                    header_matched = (byte == frame_header[0]) ? 1 : 0;
+                }
+                continue;
+            }
+
+            receive_frame[frame_pos++] = byte;
+            if (frame_pos == FRAME_BYTES) {
+                display_frame(receive_frame);
+                frame_pos = 0;
+                header_matched = 0;
+            }
+        }
     }
 }

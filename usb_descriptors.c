@@ -1,4 +1,5 @@
 #include "tusb.h"
+#include <string.h>
 
 #define USB_VID   0xCAFE
 #define USB_PID   0x4001

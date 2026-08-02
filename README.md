@@ -37,9 +37,32 @@ The firmware image is written to `build/usb2tft.uf2`.
 
 With the current test firmware, the display should repeatedly show solid red, green, and blue screens. This confirms the SPI connection and ST7735S initialization before adding the USB framebuffer protocol.
 
+## Sending live frames over USB
+
+The board enumerates as a USB CDC serial device. Each frame is a small packet header followed by 128 × 128 RGB565 pixels in big-endian order:
+
+```text
+TFT1 + 0x00008000 + RGB565 pixel data
+```
+
+Run the included sender with Python 3. It needs `Pillow` and `pyserial`:
+
+```bash
+python3 -m pip install Pillow pyserial
+python3 tools/send_frame.py /dev/ttyACM0 image.png
+```
+
+The sender resizes images to fit the screen, centre-crops them, converts them to RGB565, and streams the result. Animated GIFs are sent at their embedded frame rate (or use `--fps` to override it):
+
+```bash
+python3 tools/send_frame.py /dev/ttyACM0 animation.gif --loop
+```
+
+On Linux, the device is usually `/dev/ttyACM0`; check `dmesg` or `ls /dev/ttyACM*` if it differs.
+
 ## Current status
 
 - ST7735S initialization: working
 - SPI display writes: working
 - RGB565 colour test: working
-- USB framebuffer protocol: not yet implemented
+- USB CDC RGB565 framebuffer protocol: implemented

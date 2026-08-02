@@ -25,11 +25,20 @@ project(usb2tft C CXX ASM)
 
 pico_sdk_init()
 
-add_executable(usb2tft main.c)
+add_executable(usb2tft
+    main.c
+    usb_descriptors.c
+)
+
+target_include_directories(usb2tft PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}
+)
 
 target_link_libraries(usb2tft
     pico_stdlib
     hardware_spi
+    tinyusb_device
+    tinyusb_board
 )
 
 pico_add_extra_outputs(usb2tft)

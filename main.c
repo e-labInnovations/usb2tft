@@ -193,8 +193,13 @@ static void st7735_init(void) {
     st_cmd(ST7735_PWCTR5); st_data8(0x8A); st_data8(0xEE);
     st_cmd(ST7735_VMCTR1); st_data8(0x0E);
 
-    // RGB colour order, no rotation.  0x05 selects 16-bit RGB565 pixels.
-    st_cmd(ST77XX_MADCTL); st_data8(0x00);
+    // This panel's colour filter is physically B-G-R, so bit 3 of MADCTL is set
+    // to make the controller swap red and blue for us and ordinary RGB565 comes
+    // out correct.  With the bit clear, 0xF800 paints blue.  Note that the bit
+    // never moves green, so a host-side (B, R, G) packing cannot be corrected
+    // here at all -- see the FitPro-LT715-TLSR8232 notes on the same panel.
+    // No rotation.  COLMOD 0x05 selects 16-bit RGB565 pixels.
+    st_cmd(ST77XX_MADCTL); st_data8(0x08);
     st_cmd(ST77XX_COLMOD); st_data8(0x05);
     st_cmd(ST77XX_INVOFF);
     st_cmd(ST77XX_NORON);  sleep_ms(10);

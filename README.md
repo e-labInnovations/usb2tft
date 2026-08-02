@@ -99,6 +99,23 @@ Audio is discarded. HDR and 10-bit sources play but are not tone-mapped, so they
 
 Test clips live in `tools/assets/`, which is deliberately untracked.
 
+## Colour order
+
+This panel's colour filter is physically **B-G-R** behind the glass, so `st7735_init()` sets bit 3 of `MADCTL` to `0x08` and lets the controller swap red and blue. Hosts then send ordinary RGB565. With that bit clear, `0xF800` paints blue.
+
+The trap: **the BGR bit swaps red and blue and never moves green.** A frame with red and blue transposed still shows correct greens, so it looks plausible rather than broken — a red/green/blue cycle test passes with one channel right and two silently traded. By the same arithmetic, no `MADCTL` setting can rescue a host that packs `(B, R, G)`, because green occupies the middle six bits either way.
+
+`tools/color_test.py` makes this measurable instead of a judgement call. It sends known RGB565 words and prints what the panel should read:
+
+```bash
+python3 tools/color_test.py $PORT              # red | green | blue bars
+python3 tools/color_test.py $PORT --all        # also greys and yellow/cyan/magenta
+```
+
+If red and blue trade places while green stays put, the `MADCTL` bit is wrong. Flat saturated bars are also the easiest way to spot SPI signal trouble, since speckle shows up against a solid fill.
+
+The same panel and the same fault are written up in the sibling project `FitPro-LT715-TLSR8232`, where it was originally diagnosed.
+
 ## Frame protocol
 
 Each frame is an 8-byte header followed by 128 × 128 RGB565 pixels in big-endian order:
@@ -180,6 +197,7 @@ Compression is not the answer here: RLE and inter-frame delta both need flat or 
 
 - ST7735S initialization: working
 - SPI display writes: working, DMA at 31.25 MHz with double buffering
+- Colour order: correct — `MADCTL` BGR bit set for this panel's B-G-R filter
 - USB CDC RGB565 framebuffer protocol: working
 - Still images and animated GIFs: working
 - Live video, webcam and desktop mirroring: working at ~16 fps

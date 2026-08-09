@@ -37,12 +37,57 @@ FIT_FILTERS = {
 }
 
 
+def parse_time(text: str) -> float:
+    """Seconds from ``90``, ``1:30``, ``01:02:03`` or ``1:02:03.5``."""
+    parts = text.strip().split(":")
+    if len(parts) > 3:
+        raise ValueError(f"not a time: {text}")
+    seconds = 0.0
+    for part in parts:
+        seconds = seconds * 60 + float(part)
+    if seconds < 0:
+        raise ValueError("time may not be negative")
+    return seconds
+
+
+def format_time(seconds: float) -> str:
+    seconds = int(seconds)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def probe_duration(args):
+    """Source length in seconds, or None when ffprobe cannot say."""
+    if shutil.which("ffprobe") is None:
+        return None
+    command = ["ffprobe", "-v", "error"]
+    if args.format:
+        command += ["-f", args.format]
+    command += ["-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", args.source]
+    try:
+        output = subprocess.run(command, capture_output=True, text=True,
+                                timeout=10).stdout.strip()
+        return float(output)
+    except (subprocess.SubprocessError, ValueError):
+        # Live sources and streams have no duration; that is not an error.
+        return None
+
+
 def ffmpeg_command(args) -> list:
     command = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
     if args.loop:
         command += ["-stream_loop", "-1"]
     if args.format:
         command += ["-f", args.format]
+    if args.start:
+        # Before -i: ffmpeg seeks the input instead of decoding and discarding
+        # everything up to the mark, which on a long file is the difference
+        # between instant and a minute of waiting.
+        command += ["-ss", str(args.start)]
     command += ["-i", args.source]
     # fps= resamples any source rate, constant or variable, to ours.
     # setsar=1 keeps anamorphic sources from coming out squashed.
@@ -53,6 +98,20 @@ def ffmpeg_command(args) -> list:
         "-pix_fmt", "rgb565be",
         "-",
     ]
+    return command
+
+
+def ffplay_command(args) -> list:
+    """Play the source's audio track on this computer, no window."""
+    command = ["ffplay", "-hide_banner", "-loglevel", "error",
+               "-nodisp", "-autoexit", "-vn"]
+    if args.loop:
+        command += ["-loop", "0"]
+    if args.format:
+        command += ["-f", args.format]
+    if args.start:
+        command += ["-ss", str(args.start)]
+    command += ["-volume", str(args.volume), "-i", args.source]
     return command
 
 
@@ -79,26 +138,66 @@ def main() -> int:
                         help="Fit a non-square source to the panel (default: crop)")
     parser.add_argument("--format", help="ffmpeg input format, e.g. v4l2 or x11grab")
     parser.add_argument("--loop", action="store_true", help="Repeat the source forever")
+    parser.add_argument("--audio", action="store_true",
+                        help="Play the source's audio on this computer via ffplay")
+    parser.add_argument("--volume", type=int, default=100,
+                        help="Audio volume 0-100 for --audio (default: 100)")
     parser.add_argument("--no-drop", action="store_true",
                         help="Never skip frames, even when the link falls behind")
+    parser.add_argument("--start", default="0", metavar="TIME",
+                        help="Begin at this point: seconds, or [HH:]MM:SS (default: 0)")
+    parser.add_argument("--no-progress", action="store_true",
+                        help="Do not print the live position line")
     args = parser.parse_args()
 
     if args.fps <= 0:
         parser.error("--fps must be greater than zero")
+    try:
+        args.start = parse_time(args.start)
+    except ValueError:
+        parser.error(f"--start: not a time: {args.start!r}")
+    if not 0 <= args.volume <= 100:
+        parser.error("--volume must be between 0 and 100")
     if shutil.which("ffmpeg") is None:
         print("ffmpeg not found on PATH.", file=sys.stderr)
+        return 1
+    if args.audio and shutil.which("ffplay") is None:
+        print("ffplay not found on PATH (it ships with ffmpeg).", file=sys.stderr)
         return 1
 
     period = 1.0 / args.fps
     sent = 0
     dropped = 0
     acked = 0
+    decoded = 0
+
+    # A live source has no length; then the line shows position only.
+    duration = probe_duration(args) if not args.no_progress else None
+    if duration is not None and not args.loop and args.start >= duration:
+        print(f"--start {format_time(args.start)} is past the end of the source "
+              f"({format_time(duration)}).", file=sys.stderr)
+        return 1
+    progress = not args.no_progress and sys.stderr.isatty()
+    total = f" / {format_time(duration)}" if duration is not None else ""
+
+    def show_progress():
+        """One line, rewritten in place — \\r, no newline, no curses."""
+        position = args.start + decoded * period
+        if duration is not None and args.loop and position > duration:
+            # Wrap so a looping source reads as the source's own clock.
+            span = max(duration - args.start, period)
+            position = args.start + (position - args.start) % span
+        rate = sent / elapsed if (elapsed := time.monotonic() - start) > 0 else 0.0
+        sys.stderr.write(f"\r  {format_time(position)}{total}   {rate:5.1f} fps"
+                         f"   {dropped} dropped   ")
+        sys.stderr.flush()
 
     # Turn a kill into an ordinary unwind so ffmpeg is shut down before we stop
     # reading it; otherwise it dies complaining about a broken pipe.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     ffmpeg = subprocess.Popen(ffmpeg_command(args), stdout=subprocess.PIPE)
+    ffplay = None
     start = time.monotonic()
     try:
         with serial.Serial(args.port, 115200, timeout=0, write_timeout=5) as device:
@@ -108,10 +207,23 @@ def main() -> int:
 
             start = time.monotonic()
             deadline = start
+            next_progress = start
             while True:
                 frame = read_exact(ffmpeg.stdout, FRAME_BYTES)
                 if frame is None:
                     break
+                decoded += 1
+
+                if progress and time.monotonic() >= next_progress:
+                    show_progress()
+                    next_progress = time.monotonic() + 0.25
+
+                if args.audio and ffplay is None:
+                    # Start on the first decoded frame, not at spawn time: that
+                    # is when video actually begins, so the two stay in step.
+                    ffplay = subprocess.Popen(ffplay_command(args),
+                                              stdin=subprocess.DEVNULL)
+                    start = deadline = next_progress = time.monotonic()
 
                 deadline += period
                 now = time.monotonic()
@@ -135,8 +247,14 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        if progress and decoded:
+            show_progress()
+            sys.stderr.write("\n")
         # SIGKILL, not SIGTERM: on SIGTERM ffmpeg tries to flush its output and
         # blocks writing to a pipe we have stopped reading, so wait() deadlocks.
+        if ffplay is not None and ffplay.poll() is None:
+            ffplay.terminate()
+            ffplay.wait()
         if ffmpeg.poll() is None:
             ffmpeg.kill()
         if ffmpeg.stdout:

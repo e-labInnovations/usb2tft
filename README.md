@@ -32,11 +32,23 @@ PORT=/dev/serial/by-id/usb-e-lab_innovations_USB2TFT_000001-if00
 
 ## Host requirements
 
+The senders are plain Python 3 scripts. Install their dependencies into a virtual environment so they stay out of the system Python:
+
 ```bash
-python3 -m pip install Pillow pyserial   # both senders
+python3 -m venv .venv
+source .venv/bin/activate           # Windows: .venv\Scripts\activate
+python3 -m pip install -r tools/requirements.txt
 ```
 
-`tools/play_video.py` also needs `ffmpeg` on `PATH`.
+`.venv/` is gitignored. Activate it in every shell that runs a sender, or call the scripts through `.venv/bin/python3` directly and skip activation:
+
+```bash
+.venv/bin/python3 tools/send_frame.py $PORT image.png
+```
+
+`tools/requirements.txt` pulls in `pyserial` for all three tools and `Pillow` for `send_frame.py`. ffmpeg is not a Python package: install it from your system's package manager and have `ffmpeg` on `PATH` for `tools/play_video.py`, plus `ffplay` (same package) for its `--audio` option.
+
+On Linux, talking to the port may need your user in the `dialout` group: `sudo usermod -aG dialout $USER`, then log out and back in.
 
 ## Sending still images and GIFs
 
@@ -82,6 +94,27 @@ python3 tools/play_video.py $PORT :0.0 --format x11grab       # mirror the deskt
 | `--format F` | ffmpeg input format, for sources that are not files. |
 | `--loop` | Repeat the source forever. |
 | `--no-drop` | Send every frame and let playback lag, instead of skipping late ones. |
+| `--audio` | Play the source's audio on the computer with `ffplay`. The panel gets picture only. |
+| `--volume N` | Audio volume 0-100 for `--audio`. Default 100. |
+| `--start TIME` | Begin at this point: seconds, or `[HH:]MM:SS`. Default 0. |
+| `--no-progress` | Do not print the live position line. |
+
+```bash
+python3 tools/play_video.py $PORT video.mp4 --start 120       # two minutes in
+python3 tools/play_video.py $PORT video.mp4 --start 1:02:03 --audio
+```
+
+`--start` seeks the input rather than decoding and throwing away everything before the mark, so starting deep into a long file is immediate. It applies to the audio track too.
+
+While playing, a single line is rewritten in place with the current position, the achieved frame rate and the drop count:
+
+```
+  2:00 / 5:00    15.9 fps   1 dropped
+```
+
+The length comes from `ffprobe`; without it, or on a live source that has no length, the position shows on its own. The line goes to stderr and is skipped when stderr is not a terminal, so piping the summary stays clean.
+
+Audio runs as a separate `ffplay` process started on the first decoded frame, so it lines up with the picture at the start; long clips can drift, since nothing re-syncs the two afterwards.
 
 Any resolution, frame rate, codec and container ffmpeg can open will play. The source rate is resampled to the send rate, so a 5 fps clip has frames duplicated and a 60 fps clip has them dropped, both at correct speed; variable-rate sources are normalised the same way. Anamorphic pixel aspect ratios are corrected rather than squashed.
 

@@ -10,9 +10,10 @@
 .DS_Store
 
 
-# Python bytecode
+# Python bytecode and virtualenv
 __pycache__/
 *.pyc
+/.venv/
 
 # Test media
 /tools/assets/

@@ -1,0 +1,4 @@
+# Host-side senders in tools/. ffmpeg (and ffplay, for play_video.py --audio)
+# are separate system packages, not installable from here.
+pyserial>=3.5      # all three tools
+Pillow>=10.0.0     # send_frame.py only

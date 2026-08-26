@@ -52,6 +52,15 @@
 #define TFT_HEIGHT  128
 #define FRAME_BYTES (TFT_WIDTH * TFT_HEIGHT * 2)
 
+// The ST7735S has 132 x 162 of GRAM but this panel's glass only shows a
+// 128 x 128 window inside it, starting at column 2 and row 1.  Without these
+// offsets the last two columns and the last row of the visible area are never
+// written and show whatever the controller powered up with (white, plus a few
+// pixels that track our data).  Two different panels showed it identically,
+// which is what ruled out the physical edge damage on the first one.
+#define TFT_COL_OFFSET  2
+#define TFT_ROW_OFFSET  1
+
 // USB frame protocol:
 //   54 46 54 31  00 00 80 00  [32,768 RGB565 bytes, big-endian]
 //       "TFT1"       payload length
@@ -110,17 +119,30 @@ static void gpio_init_all(void) {
 }
 
 static void set_full_window(void) {
+    const uint8_t x0 = TFT_COL_OFFSET, x1 = TFT_COL_OFFSET + TFT_WIDTH  - 1;
+    const uint8_t y0 = TFT_ROW_OFFSET, y1 = TFT_ROW_OFFSET + TFT_HEIGHT - 1;
+
     st_cmd(ST77XX_CASET);
-    st_data8(0); st_data8(0); st_data8(0); st_data8(TFT_WIDTH - 1);
+    st_data8(0); st_data8(x0); st_data8(0); st_data8(x1);
     st_cmd(ST77XX_RASET);
-    st_data8(0); st_data8(0); st_data8(0); st_data8(TFT_HEIGHT - 1);
+    st_data8(0); st_data8(y0); st_data8(0); st_data8(y1);
     st_cmd(ST77XX_RAMWR);
 }
 
-static void bare_fill(uint16_t color) {
+// Paint the whole 132 x 162 GRAM, not just the visible window, so that any
+// pixel outside the addressed area is black rather than power-on white.  Only
+// needed once at boot; every frame after that goes through set_full_window().
+#define TFT_GRAM_WIDTH   132
+#define TFT_GRAM_HEIGHT  162
+
+static void bare_fill_gram(uint16_t color) {
     cs_low();
-    set_full_window();
-    for (uint32_t i = 0; i < TFT_WIDTH * TFT_HEIGHT; i++) st_data16(color);
+    st_cmd(ST77XX_CASET);
+    st_data8(0); st_data8(0); st_data8(0); st_data8(TFT_GRAM_WIDTH - 1);
+    st_cmd(ST77XX_RASET);
+    st_data8(0); st_data8(0); st_data8(0); st_data8(TFT_GRAM_HEIGHT - 1);
+    st_cmd(ST77XX_RAMWR);
+    for (uint32_t i = 0; i < TFT_GRAM_WIDTH * TFT_GRAM_HEIGHT; i++) st_data16(color);
     cs_high();
 }
 
@@ -219,7 +241,7 @@ int main(void) {
     gpio_put(PIN_RST, 1); sleep_ms(150);
 
     st7735_init();
-    bare_fill(0x0000);
+    bare_fill_gram(0x0000);
 
     dma_chan = dma_claim_unused_channel(true);
 

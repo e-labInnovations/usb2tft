@@ -6,6 +6,8 @@
 #include "tusb.h"
 #include "bsp/board_api.h"
 
+#include "splash.h"
+
 // --- Pin definitions ---
 // GP3 dead, GP6 was bit-bang MOSI → now using hardware SPI0
 // Move SDA wire from GP6 → GP7 (SPI0 TX)
@@ -146,6 +148,18 @@ static void bare_fill_gram(uint16_t color) {
     cs_high();
 }
 
+// Boot screen.  The panel holds whatever was last written to it, so this needs
+// no timer: it stays up until the first USB frame overwrites it.  Painted
+// blocking, before tusb_init(), because 32 KB at 31.25 MHz is 8.4 ms and there
+// is no USB traffic to starve yet.
+static void draw_splash(void) {
+    _Static_assert(SPLASH_BYTES == FRAME_BYTES, "splash.h does not match the panel");
+    cs_low();
+    set_full_window();
+    spi_write_blocking(SPI_PORT, splash_rgb565, SPLASH_BYTES);
+    cs_high();
+}
+
 // Hand a completed framebuffer to DMA and return immediately.  CS stays
 // asserted for the whole transfer and is released in display_poll().
 static void display_start(const uint8_t *pixels) {
@@ -242,6 +256,7 @@ int main(void) {
 
     st7735_init();
     bare_fill_gram(0x0000);
+    draw_splash();
 
     dma_chan = dma_claim_unused_channel(true);
 

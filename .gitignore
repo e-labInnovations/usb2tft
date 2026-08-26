@@ -1,5 +1,6 @@
 # Pico SDK / CMake build output
 /build/
+/build-*/
 
 # Editor settings and workspace files
 /.vscode/

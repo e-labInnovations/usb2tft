@@ -28,7 +28,19 @@ pico_sdk_init()
 add_executable(usb2tft
     main.c
     usb_descriptors.c
+    audio.c
 )
+
+# I2S output for the MAX98357A.  The RP2040 has no I2S peripheral, so this is a
+# PIO program and the header it generates is what audio.c includes.
+pico_generate_pio_header(usb2tft ${CMAKE_CURRENT_LIST_DIR}/i2s.pio)
+
+# Continuous 440 Hz tone instead of USB audio, for proving the amp and the
+# wiring on their own:  cmake -B build-tone -DAUDIO_TEST_TONE=ON
+option(AUDIO_TEST_TONE "Play a test tone instead of taking audio from USB" OFF)
+if (AUDIO_TEST_TONE)
+    target_compile_definitions(usb2tft PRIVATE AUDIO_TEST_TONE=1)
+endif()
 
 target_include_directories(usb2tft PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
@@ -39,6 +51,7 @@ target_link_libraries(usb2tft
     pico_bootrom
     hardware_spi
     hardware_dma
+    hardware_pio
     tinyusb_device
     tinyusb_board
 )

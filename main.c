@@ -6,6 +6,7 @@
 #include "tusb.h"
 #include "bsp/board_api.h"
 
+#include "audio.h"
 #include "splash.h"
 
 // --- Pin definitions ---
@@ -76,6 +77,11 @@ static const uint8_t frame_header[] = {
 };
 
 #define FRAME_ACK 'K'
+
+// 22.05 kHz mono, half of CD rate.  A one inch speaker does not reproduce the
+// 11 kHz this leaves, and as IMA ADPCM it costs 2.1% of a bus that video has
+// already filled.  See docs/audio-plan.md.
+#define AUDIO_SAMPLE_RATE 22050
 
 // Two framebuffers: USB fills one while DMA streams the other to the panel.
 // The RP2040's default main stack is far smaller than a single framebuffer, so
@@ -259,6 +265,13 @@ int main(void) {
     draw_splash();
 
     dma_chan = dma_claim_unused_channel(true);
+
+    audio_init(AUDIO_SAMPLE_RATE);
+#if AUDIO_TEST_TONE
+    // Milestone 1: prove the clock, the wiring, the amp and the speaker with
+    // nothing else in the path.  USB audio does not exist yet.
+    audio_set_source(audio_test_tone);
+#endif
 
     tusb_rhport_init_t usb_init = {
         .role = TUSB_ROLE_DEVICE,

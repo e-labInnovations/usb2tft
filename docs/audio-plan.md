@@ -30,8 +30,8 @@ wrong ADPCM decoder and a wrong I2S clock both sound like noise, and debugging
 two unknowns at once is how the colour bug survived a month.
 
 22.05 kHz gives 11 kHz of audio bandwidth, which is already more than a one
-inch speaker reproduces. The PIO clock divider lands on 44.28 rather than an
-integer, a 0.05% pitch error, about 0.9 cents. Inaudible.
+inch speaker reproduces. The PIO clock divider lands on 88.578 rather than an
+integer, a 0.0012% pitch error. Inaudible.
 
 ## Why PIO and not a peripheral
 
@@ -50,14 +50,16 @@ Both PIO blocks are free: the panel is on hardware SPI0.
 
 ### Clocking
 
-Standard I2S, 16 bits per channel, two channels per frame, so BCLK is 64x Fs
-and the PIO program needs 2 cycles per bit:
+Standard I2S, 16 bits per channel, two channels per frame, so a frame is 32
+bits, the PIO program spends 2 cycles per bit, and BCLK comes out at 32x Fs:
 
-    clkdiv = 125 MHz / (22050 x 64 x 2) = 44.28
+    clkdiv = 125 MHz / (22050 x 32 x 2) = 88.577
 
-The RP2040's divider has an 8-bit fraction, so 44.28 is reachable. The mono
+The RP2040's divider is 16.8 fixed point, so the reachable value is 88.578,
+which puts Fs at 22049.74, an error of 0.0012% or about 0.02 cents. The mono
 stream is written into both channels, which costs I2S bit rate (free, it is a
-local wire) rather than USB bandwidth (not free).
+local wire) rather than USB bandwidth (not free), and means SD_MODE can select
+either channel without the firmware caring.
 
 The MAX98357A needs no MCLK, which is the reason to prefer it here over an
 I2S DAC that does.

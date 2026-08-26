@@ -1,0 +1,68 @@
+; I2S master output for the MAX98357A.  The RP2040 has no I2S peripheral, so
+; the timing lives in a PIO state machine and the CPU only refills a DMA
+; buffer.  16 bits per channel, two channels, two PIO cycles per bit, so one
+; stereo frame is 64 PIO cycles and BCLK comes out at 32 x Fs.
+;
+; side-set bit 0 drives BCLK, bit 1 drives LRCLK.
+;
+; Every data bit is presented while BCLK is low and sampled by the amplifier
+; on the following rising edge, which gives a full half-cycle of setup time.
+; LRCLK changes one bit early, during the last bit of the previous channel:
+; that one bit of delay is what makes this I2S rather than left-justified, and
+; getting it wrong shifts every sample by one bit, which sounds like distortion
+; rather than like a clocking fault.
+
+.program i2s_out
+.side_set 2
+
+.wrap_target
+    ; --- left channel, LRCLK low ---
+    ; x arrives holding 14, set by the tail of the previous frame.
+left_bits:
+    out pins, 1             side 0b00
+    jmp x-- left_bits       side 0b01
+    ; 16th left bit.  LRCLK goes high here, one bit ahead of the right channel.
+    out pins, 1             side 0b10
+    set x, 14               side 0b11
+
+    ; --- right channel, LRCLK high ---
+right_bits:
+    out pins, 1             side 0b10
+    jmp x-- right_bits      side 0b11
+    ; 16th right bit.  LRCLK returns low for the next left channel.
+    out pins, 1             side 0b00
+public entry_point:
+    set x, 14               side 0b01
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+// data_pin is DIN.  clock_pin_base is BCLK, and LRCLK must be the next GPIO up
+// because the two share one side-set field.
+static inline void i2s_out_program_init(PIO pio, uint sm, uint offset,
+                                        uint data_pin, uint clock_pin_base,
+                                        uint32_t sample_rate) {
+    pio_gpio_init(pio, data_pin);
+    pio_gpio_init(pio, clock_pin_base);
+    pio_gpio_init(pio, clock_pin_base + 1);
+    pio_sm_set_consecutive_pindirs(pio, sm, data_pin, 1, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, clock_pin_base, 2, true);
+
+    pio_sm_config c = i2s_out_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, data_pin, 1);
+    sm_config_set_sideset_pins(&c, clock_pin_base);
+
+    // Shift left so the MSB leaves first, and autopull a fresh 32-bit stereo
+    // frame exactly when the previous one has been consumed.
+    sm_config_set_out_shift(&c, false, true, 32);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    // 64 PIO cycles per stereo frame.  At 22050 Hz this is 88.578, and the
+    // divider's 8 fractional bits land within 0.0012% of the target.
+    sm_config_set_clkdiv(&c, (float) clock_get_hz(clk_sys) / (sample_rate * 64.0f));
+
+    pio_sm_init(pio, sm, offset + i2s_out_offset_entry_point, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

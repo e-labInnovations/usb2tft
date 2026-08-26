@@ -35,6 +35,8 @@ static volatile audio_source_t audio_src = NULL;
 static volatile uint32_t underruns = 0;
 static uint32_t audio_fs = 0;
 static volatile uint32_t stream_restarts = 0;
+static volatile uint32_t samples_out = 0;   // frames handed to I2S, silence included
+static volatile uint32_t last_push_us = 0;
 
 // SD_MODE on the MAX98357A selects which channel the single speaker gets, so
 // the same mono sample goes into both halves of the frame and the wiring
@@ -45,7 +47,12 @@ static void fill_half(uint32_t *dst) {
 
     if (src != NULL) got = src(mono_scratch, HALF_FRAMES);
     if (got < HALF_FRAMES) {
-        if (src != NULL) underruns++;
+        // Silence between tracks is not a fault.  Only count a short fill while
+        // a stream is actually running, otherwise an idle board accumulates 86
+        // "underruns" a second and hands the whole backlog to the next host
+        // that opens the port, which is how these numbers first read as
+        // thousands of dropouts in a clean run.
+        if (src != NULL && (time_us_32() - last_push_us) < 500000u) underruns++;
         memset(&mono_scratch[got], 0, (HALF_FRAMES - got) * sizeof(mono_scratch[0]));
     }
 
@@ -53,6 +60,7 @@ static void fill_half(uint32_t *dst) {
         uint32_t sample = (uint16_t) mono_scratch[i];
         dst[i] = (sample << 16) | sample;
     }
+    samples_out += HALF_FRAMES;
 }
 
 // --- Stream control ---
@@ -191,6 +199,10 @@ uint32_t audio_stream_restarts(void) {
     return stream_restarts;
 }
 
+uint32_t audio_samples_out(void) {
+    return samples_out;
+}
+
 
 // --- Sample ring ---
 // Filled by the USB loop, drained by the DMA interrupt: one producer, one
@@ -220,6 +232,8 @@ void audio_reset(void) {
 }
 
 size_t audio_push(const uint8_t *bytes, size_t count) {
+    last_push_us = time_us_32();
+
     uint32_t free_bytes = RING_BYTES - ring_used();
     if (count > free_bytes) {
         ring_overflows++;
@@ -239,6 +253,19 @@ uint32_t audio_buffered_ms(void) {
 
 uint32_t audio_overflows(void) {
     return ring_overflows;
+}
+
+// Called when a new stream starts, so each playback session reports its own
+// numbers rather than everything since boot.
+void audio_reset_stats(void) {
+    underruns = 0;
+    ring_overflows = 0;
+}
+
+// Microseconds since audio last arrived.  A new stream is one that starts after
+// a gap, which is when the counters are worth clearing.
+uint32_t audio_idle_us(void) {
+    return time_us_32() - last_push_us;
 }
 
 // s16le on the wire, little endian in memory, so this could be a memcpy for

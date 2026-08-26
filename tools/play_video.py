@@ -8,11 +8,13 @@ a video file, a webcam (``-f v4l2 /dev/video0``) or the desktop
 """
 
 import argparse
+import os
 import shutil
 import signal
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 import serial
@@ -22,6 +24,19 @@ HEIGHT = 128
 FRAME_BYTES = WIDTH * HEIGHT * 2
 HEADER = b"TFT1" + struct.pack(">I", FRAME_BYTES)
 FRAME_ACK = b"K"
+
+# Audio shares the one bulk endpoint with video, so every byte of sound is a
+# byte of picture.  s16le mono at 22.05 kHz is 44,100 B/s against a measured
+# ceiling of 512 KiB/s, about 8% of the bus, which shows up as a lower frame
+# rate rather than as dropped audio: the board plays silence when it runs dry,
+# and silence is the one failure everybody hears.
+AUDIO_RATE = 22050
+AUDIO_BYTES_PER_SECOND = AUDIO_RATE * 2
+AUDIO_CHUNK = 1024                      # 23 ms
+AUDIO_HEADER = b"PCM1"
+UNDERRUN_ACK = b"U"
+OVERFLOW_ACK = b"O"
+RESTART_ACK = b"R"
 
 
 # How to reconcile a source of any shape with the square panel.
@@ -92,13 +107,90 @@ def ffmpeg_command(args) -> list:
     # fps= resamples any source rate, constant or variable, to ours.
     # setsar=1 keeps anamorphic sources from coming out squashed.
     command += [
+        "-map", "0:v:0",
         "-vf", f"fps={args.fps},{FIT_FILTERS[args.fit]},setsar=1",
         "-an",
         "-f", "rawvideo",
         "-pix_fmt", "rgb565be",
         "-",
     ]
+    # One process decodes once and writes both streams, video on fd 3 and audio
+    # on fd 4.  Two processes meant decoding the same file twice, and on a
+    # laptop that competition cost more frame rate than the audio bandwidth did.
+    if args.audio:
+        # pipe:N takes the real descriptor number, which is whatever the OS
+        # handed us: pass_fds keeps a descriptor open across the fork but does
+        # not renumber it, so hardcoding 4 gets "Bad file descriptor".
+        command += audio_output_args(args, f"pipe:{args.audio_fd}")
     return command
+
+
+def audio_output_args(args, target: str) -> list:
+    """The audio half of the ffmpeg command line, written to *target*."""
+    out = ["-map", "0:a:0",
+           "-vn", "-ac", "1", "-ar", str(AUDIO_RATE),
+           "-f", "s16le", "-acodec", "pcm_s16le"]
+    if args.volume != 100:
+        out += ["-filter:a", f"volume={args.volume / 100:.3f}"]
+    return out + [target]
+
+
+def has_audio_stream(args) -> bool:
+    """False for a webcam, a screen grab, or a file with no audio track."""
+    if shutil.which("ffprobe") is None:
+        return True
+    command = ["ffprobe", "-v", "error"]
+    if args.format:
+        command += ["-f", args.format]
+    command += ["-select_streams", "a", "-show_entries", "stream=index",
+                "-of", "csv=p=0", args.source]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        return bool(result.stdout.strip())
+    except subprocess.SubprocessError:
+        return True
+
+
+class AudioReader:
+    """Decoded audio, read on a thread so the video path never blocks on it.
+
+    A blocking pipe read in the middle of the send loop was costing a third of
+    the frame rate: ffmpeg would be busy with a video packet, the read would
+    stall, and the board's ring would run dry while the loop waited.
+    """
+
+    LIMIT = 1 << 20   # 24 s of audio; keeps a long clip from growing unbounded
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._buffer = bytearray()
+        self._lock = threading.Lock()
+        self._room = threading.Event()
+        self._room.set()
+        self.eof = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while True:
+            self._room.wait()
+            data = self._stream.read(AUDIO_CHUNK * 8)
+            if not data:
+                self.eof = True
+                return
+            with self._lock:
+                self._buffer += data
+                if len(self._buffer) > self.LIMIT:
+                    self._room.clear()
+
+    def take(self, count: int) -> bytes:
+        """Up to *count* bytes, or b"" when nothing is buffered yet."""
+        with self._lock:
+            chunk = bytes(self._buffer[:count])
+            del self._buffer[:len(chunk)]
+            if len(self._buffer) <= self.LIMIT // 2:
+                self._room.set()
+        return chunk
 
 
 def ffplay_command(args) -> list:
@@ -132,16 +224,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("port", help="USB CDC port, e.g. /dev/ttyACM0")
     parser.add_argument("source", help="Video file, or any ffmpeg input")
-    parser.add_argument("--fps", type=float, default=16.0,
-                        help="Frames per second to send (default: 16, the USB CDC ceiling)")
+    parser.add_argument("--fps", type=float, default=None,
+                        help="Frames per second to send (default: 16, or 14 with "
+                             "--audio, which is what the bus has left)")
     parser.add_argument("--fit", choices=sorted(FIT_FILTERS), default="crop",
                         help="Fit a non-square source to the panel (default: crop)")
     parser.add_argument("--format", help="ffmpeg input format, e.g. v4l2 or x11grab")
     parser.add_argument("--loop", action="store_true", help="Repeat the source forever")
     parser.add_argument("--audio", action="store_true",
-                        help="Play the source's audio on this computer via ffplay")
+                        help="Send the source's audio to the board's speaker")
+    parser.add_argument("--audio-host", action="store_true",
+                        help="Play the audio on this computer via ffplay instead")
     parser.add_argument("--volume", type=int, default=100,
-                        help="Audio volume 0-100 for --audio (default: 100)")
+                        help="Audio volume 0-100 (default: 100)")
+    parser.add_argument("--lead", type=float, default=150.0, metavar="MS",
+                        help="Audio buffered ahead of real time, and the amount "
+                             "the video is delayed to match (default: 150)")
     parser.add_argument("--no-drop", action="store_true",
                         help="Never skip frames, even when the link falls behind")
     parser.add_argument("--start", default="0", metavar="TIME",
@@ -150,6 +248,14 @@ def main() -> int:
                         help="Do not print the live position line")
     args = parser.parse_args()
 
+    if args.fps is None:
+        # Audio and video share one saturated endpoint.  512 KiB/s less the
+        # 44 KiB/s the samples need leaves 14.3 frames, and asking for 16
+        # anyway does not get them: the writes fall behind, frames drop, and
+        # the jitter that causes is what starves the board's audio ring.
+        # Measured: 16 asked gives 12.4 fps with 63 underruns, 14 asked gives
+        # 13.8 fps with 8 and nothing dropped.
+        args.fps = 14.0 if args.audio else 16.0
     if args.fps <= 0:
         parser.error("--fps must be greater than zero")
     try:
@@ -161,7 +267,14 @@ def main() -> int:
     if shutil.which("ffmpeg") is None:
         print("ffmpeg not found on PATH.", file=sys.stderr)
         return 1
-    if args.audio and shutil.which("ffplay") is None:
+    if args.audio and args.audio_host:
+        parser.error("--audio and --audio-host are exclusive")
+    if args.audio and not has_audio_stream(args):
+        print("source has no audio track; sending video only", file=sys.stderr)
+        args.audio = False
+    if args.lead < 0:
+        parser.error("--lead may not be negative")
+    if args.audio_host and shutil.which("ffplay") is None:
         print("ffplay not found on PATH (it ships with ffmpeg).", file=sys.stderr)
         return 1
 
@@ -170,6 +283,10 @@ def main() -> int:
     dropped = 0
     acked = 0
     decoded = 0
+    audio_sent = 0
+    underruns = 0
+    overflows = 0
+    restarts = 0
 
     # A live source has no length; then the line shows position only.
     duration = probe_duration(args) if not args.no_progress else None
@@ -196,7 +313,17 @@ def main() -> int:
     # reading it; otherwise it dies complaining about a broken pipe.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
-    ffmpeg = subprocess.Popen(ffmpeg_command(args), stdout=subprocess.PIPE)
+    if args.audio:
+        audio_read, audio_write = os.pipe()
+        args.audio_fd = audio_write
+        ffmpeg = subprocess.Popen(ffmpeg_command(args), stdout=subprocess.PIPE,
+                                  pass_fds=(audio_write,))
+        os.close(audio_write)
+        audio = AudioReader(os.fdopen(audio_read, "rb", 0))
+    else:
+        ffmpeg = subprocess.Popen(ffmpeg_command(args), stdout=subprocess.PIPE)
+        audio = None
+    video_stream = ffmpeg.stdout
     ffplay = None
     start = time.monotonic()
     try:
@@ -206,10 +333,36 @@ def main() -> int:
             device.reset_input_buffer()
 
             start = time.monotonic()
-            deadline = start
+            pending = []
+            # Video is held back by the audio lead so the two line up: the
+            # board is deliberately playing sound from `lead` milliseconds ago.
+            deadline = start + (args.lead / 1000.0 if audio else 0.0)
             next_progress = start
+
+            def due_audio() -> list:
+                """Chunks the board should have by now, as wire-ready bytes.
+
+                Nothing here blocks or writes: what the reader thread has not
+                produced yet is simply not sent, and the caller decides when the
+                bytes go out.  Writing flat out instead of on a schedule fills
+                the board's ring in the first second and everything after it is
+                dropped.
+                """
+                nonlocal audio_sent
+                parts = []
+                while True:
+                    due = start + audio_sent / AUDIO_BYTES_PER_SECOND - args.lead / 1000.0
+                    if time.monotonic() < due:
+                        return parts
+                    chunk = audio.take(AUDIO_CHUNK)
+                    if not chunk:
+                        return parts
+                    parts.append(AUDIO_HEADER + struct.pack(">I", len(chunk)))
+                    parts.append(chunk)
+                    audio_sent += len(chunk)
+
             while True:
-                frame = read_exact(ffmpeg.stdout, FRAME_BYTES)
+                frame = read_exact(video_stream, FRAME_BYTES)
                 if frame is None:
                     break
                 decoded += 1
@@ -218,7 +371,7 @@ def main() -> int:
                     show_progress()
                     next_progress = time.monotonic() + 0.25
 
-                if args.audio and ffplay is None:
+                if args.audio_host and ffplay is None:
                     # Start on the first decoded frame, not at spawn time: that
                     # is when video actually begins, so the two stay in step.
                     ffplay = subprocess.Popen(ffplay_command(args),
@@ -228,7 +381,13 @@ def main() -> int:
                 deadline += period
                 now = time.monotonic()
                 if now < deadline:
-                    time.sleep(deadline - now)
+                    # Audio is not idle time: fill the wait with whatever the
+                    # board is due, then sleep out the remainder.
+                    if audio is not None:
+                        pending += due_audio()
+                        now = time.monotonic()
+                    if now < deadline:
+                        time.sleep(deadline - now)
                 elif not args.no_drop and now > deadline + period:
                     # More than one period behind: skip this frame so playback
                     # tracks wall clock instead of drifting further back.
@@ -236,14 +395,28 @@ def main() -> int:
                     deadline = now
                     continue
 
-                device.write(HEADER)
-                device.write(frame)
+                # One write per frame, with the audio that is due in front of
+                # it.  Each write on a tty costs a couple of milliseconds of
+                # fixed latency, so nine of them per frame (a sliced frame plus
+                # its audio) cost about 25 ms and a third of the frame rate.
+                # The audio jitter this introduces is one frame period, well
+                # inside the board's 372 ms ring.
+                if audio is not None:
+                    pending += due_audio()
+                pending.append(HEADER)
+                pending.append(frame)
+                device.write(b"".join(pending))
+                pending.clear()
                 sent += 1
 
-                # Count the board's per-frame acknowledgements without blocking.
+                # Count the board's replies without blocking.
                 waiting = device.in_waiting
                 if waiting:
-                    acked += device.read(waiting).count(FRAME_ACK)
+                    replies = device.read(waiting)
+                    acked += replies.count(FRAME_ACK)
+                    underruns += replies.count(UNDERRUN_ACK)
+                    overflows += replies.count(OVERFLOW_ACK)
+                    restarts += replies.count(RESTART_ACK)
     except KeyboardInterrupt:
         pass
     finally:
@@ -257,15 +430,22 @@ def main() -> int:
             ffplay.wait()
         if ffmpeg.poll() is None:
             ffmpeg.kill()
-        if ffmpeg.stdout:
-            ffmpeg.stdout.close()
+        try:
+            video_stream.close()
+        except OSError:
+            pass
         ffmpeg.wait()
 
         elapsed = time.monotonic() - start
         if elapsed > 0:
-            print(f"sent {sent} frames in {elapsed:.1f}s "
-                  f"({sent / elapsed:.1f} fps), {dropped} dropped, "
-                  f"{acked} acknowledged by the board")
+            summary = (f"sent {sent} frames in {elapsed:.1f}s "
+                       f"({sent / elapsed:.1f} fps), {dropped} dropped, "
+                       f"{acked} acknowledged by the board")
+            if audio is not None:
+                summary += (f"; {audio_sent / AUDIO_BYTES_PER_SECOND:.1f}s of audio, "
+                            f"{underruns} underruns, {overflows} overflows, "
+                            f"{restarts} chain restarts")
+            print(summary)
 
     return 0
 

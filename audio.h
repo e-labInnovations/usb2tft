@@ -63,8 +63,19 @@ uint32_t audio_buffered_ms(void);
 // underrun means it is too far behind.
 uint32_t audio_overflows(void);
 
+// Clears the fault counters, and how long since audio last arrived, so a new
+// stream can start from zero instead of inheriting an idle board's silence.
+void audio_reset_stats(void);
+uint32_t audio_idle_us(void);
+
 // The ring, as a sample source for audio_set_source().
 size_t audio_ring_source(int16_t *samples, size_t count);
+
+// Frames handed to the I2S engine since boot, silence included.  Divided by
+// elapsed time this is the real sample clock, which is the only way to tell a
+// correct divider from a plausible one: both sound like audio, one sounds
+// wrong.
+uint32_t audio_samples_out(void);
 
 // 440 Hz sine from a table, for proving the wiring before any USB audio
 // exists.  Install it with audio_set_source().

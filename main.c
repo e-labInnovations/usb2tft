@@ -79,19 +79,28 @@
 //   'K'  a frame has finished painting
 //   'O'  audio arrived faster than it could be played, and was dropped
 //   'U'  audio ran dry and silence was played instead
+//   'R'  the audio DMA chain had stopped and was restarted
+//
+// "STAT" with a zero length asks for counters: the reply is 'S' followed by
+// four big-endian u32s, frames handed to I2S, underruns, overflows, restarts.
+// Two of those a few seconds apart give the real sample clock.
 #define MAGIC_LEN 4
 static const char MAGIC_VIDEO[MAGIC_LEN] = { 'T', 'F', 'T', '1' };
 static const char MAGIC_PCM[MAGIC_LEN]   = { 'P', 'C', 'M', '1' };
+static const char MAGIC_STAT[MAGIC_LEN]  = { 'S', 'T', 'A', 'T' };
 
 // A single audio chunk should be short enough that it never delays a frame for
 // long: 1 KB is 23 ms of audio and 2 ms of bus time.
 #define AUDIO_CHUNK_MAX 4096
 
 typedef enum { RX_MAGIC, RX_LENGTH, RX_VIDEO, RX_AUDIO } rx_state_t;
+typedef enum { CHUNK_VIDEO, CHUNK_PCM, CHUNK_STAT } chunk_kind_t;
 
 #define FRAME_ACK    'K'
 #define AUDIO_OVERFLOW_ACK 'O'
 #define AUDIO_UNDERRUN_ACK 'U'
+#define AUDIO_RESTART_ACK  'R'
+#define STAT_REPLY         'S'
 
 // 22.05 kHz mono, half of CD rate.  A one inch speaker does not reproduce the
 // 11 kHz this leaves, and as IMA ADPCM it costs 2.1% of a bus that video has
@@ -224,6 +233,15 @@ static void display_poll(void) {
 // instead of being something you hear and guess at.
 static uint32_t reported_underruns = 0;
 static uint32_t reported_overflows = 0;
+static uint32_t reported_restarts = 0;
+static bool stat_pending = false;
+
+static void write_be32(uint32_t value) {
+    tud_cdc_write_char((value >> 24) & 0xff);
+    tud_cdc_write_char((value >> 16) & 0xff);
+    tud_cdc_write_char((value >> 8) & 0xff);
+    tud_cdc_write_char(value & 0xff);
+}
 
 static void service_ack(void) {
     if (tud_cdc_write_available() == 0) return;
@@ -239,6 +257,18 @@ static void service_ack(void) {
     if (audio_overflows() != reported_overflows) {
         reported_overflows++;
         tud_cdc_write_char(AUDIO_OVERFLOW_ACK);
+    }
+    if (audio_stream_restarts() != reported_restarts) {
+        reported_restarts++;
+        tud_cdc_write_char(AUDIO_RESTART_ACK);
+    }
+    if (stat_pending && tud_cdc_write_available() >= 17) {
+        tud_cdc_write_char(STAT_REPLY);
+        write_be32(audio_samples_out());
+        write_be32(audio_underruns());
+        write_be32(audio_overflows());
+        write_be32(audio_stream_restarts());
+        stat_pending = false;
     }
     tud_cdc_write_flush();
 }
@@ -333,7 +363,7 @@ int main(void) {
 
     rx_state_t rx_state = RX_MAGIC;
     char magic_window[MAGIC_LEN] = { 0 };
-    bool want_video = false;
+    chunk_kind_t kind = CHUNK_VIDEO;
     uint32_t payload_len = 0;
     uint32_t payload_pos = 0;
     uint8_t length_bytes = 0;
@@ -372,9 +402,11 @@ int main(void) {
                 magic_window[3] = (char) byte;
 
                 if (memcmp(magic_window, MAGIC_VIDEO, MAGIC_LEN) == 0) {
-                    want_video = true;
+                    kind = CHUNK_VIDEO;
                 } else if (memcmp(magic_window, MAGIC_PCM, MAGIC_LEN) == 0) {
-                    want_video = false;
+                    kind = CHUNK_PCM;
+                } else if (memcmp(magic_window, MAGIC_STAT, MAGIC_LEN) == 0) {
+                    kind = CHUNK_STAT;
                 } else {
                     continue;
                 }
@@ -393,14 +425,23 @@ int main(void) {
                 // A length the firmware cannot honour means the magic was a
                 // coincidence in the middle of a payload, so go back to
                 // scanning instead of trusting it.
-                uint32_t limit = want_video ? FRAME_BYTES : AUDIO_CHUNK_MAX;
-                bool sane = want_video ? (payload_len == FRAME_BYTES)
-                                       : (payload_len > 0 && payload_len <= limit);
+                bool sane;
+                switch (kind) {
+                    case CHUNK_VIDEO: sane = (payload_len == FRAME_BYTES); break;
+                    case CHUNK_PCM:   sane = (payload_len > 0 &&
+                                              payload_len <= AUDIO_CHUNK_MAX); break;
+                    default:          sane = (payload_len == 0); break;
+                }
                 if (!sane) {
                     rx_state = RX_MAGIC;
                     continue;
                 }
-                rx_state = want_video ? RX_VIDEO : RX_AUDIO;
+                if (kind == CHUNK_STAT) {
+                    stat_pending = true;
+                    rx_state = RX_MAGIC;
+                    continue;
+                }
+                rx_state = (kind == CHUNK_VIDEO) ? RX_VIDEO : RX_AUDIO;
                 payload_pos = 0;
                 continue;
             }
@@ -434,6 +475,14 @@ int main(void) {
             if (want > sizeof(audio_scratch)) want = sizeof(audio_scratch);
             uint32_t got = tud_cdc_read(audio_scratch, want);
             if (got == 0) break;
+
+            // Audio after a gap is a new stream, so its counters start clean
+            // and the host is not handed the previous session's faults.
+            if (audio_idle_us() > 1000000u) {
+                audio_reset_stats();
+                reported_underruns = 0;
+                reported_overflows = 0;
+            }
             payload_pos += got;
             audio_push(audio_scratch, got);
             if (payload_pos == payload_len) rx_state = RX_MAGIC;

@@ -29,6 +29,7 @@ MAGIC_PCM = b"PCM1"
 FRAME_ACK = ord("K")
 UNDERRUN = ord("U")
 OVERFLOW = ord("O")
+RESTART = ord("R")
 
 
 def ffmpeg_command(args) -> list:
@@ -77,6 +78,7 @@ def main() -> int:
     sent = 0
     underruns = 0
     overflows = 0
+    restarts = 0
     start = time.monotonic()
 
     try:
@@ -108,6 +110,7 @@ def main() -> int:
                     replies = device.read(waiting)
                     underruns += replies.count(bytes([UNDERRUN]))
                     overflows += replies.count(bytes([OVERFLOW]))
+                    restarts += replies.count(bytes([RESTART]))
     except KeyboardInterrupt:
         pass
     finally:
@@ -122,7 +125,8 @@ def main() -> int:
         elapsed = time.monotonic() - start
         seconds = sent / bytes_per_second
         print(f"sent {seconds:.1f}s of audio in {elapsed:.1f}s "
-              f"({sent / 1024:.0f} KiB, {underruns} underruns, {overflows} overflows)")
+              f"({sent / 1024:.0f} KiB, {underruns} underruns, "
+              f"{overflows} overflows, {restarts} chain restarts)")
     return 0
 
 

@@ -1,4 +1,6 @@
 
+#include <string.h>
+
 #include "pico/stdlib.h"
 #include "pico/bootrom.h"
 #include "hardware/spi.h"
@@ -64,19 +66,32 @@
 #define TFT_COL_OFFSET  2
 #define TFT_ROW_OFFSET  1
 
-// USB frame protocol:
-//   54 46 54 31  00 00 80 00  [32,768 RGB565 bytes, big-endian]
-//       "TFT1"       payload length
-// One 'K' byte is sent back per displayed frame so the host can pace itself.
-static const uint8_t frame_header[] = {
-    'T', 'F', 'T', '1',
-    (FRAME_BYTES >> 24) & 0xff,
-    (FRAME_BYTES >> 16) & 0xff,
-    (FRAME_BYTES >> 8) & 0xff,
-    FRAME_BYTES & 0xff,
-};
+// USB chunk protocol.  Every chunk is a 4-byte magic and a big-endian u32
+// payload length, and the reader scans for the magic rather than assuming the
+// stream is aligned, so a sender that dies mid-chunk costs one chunk instead of
+// desynchronising everything after it.
+//
+//   "TFT1" 00 00 80 00  [32,768 RGB565 bytes, big-endian]   one full frame
+//   "PCM1" 00 00 04 00  [1,024 bytes of s16le mono]         audio samples
+//
+// Replies, one byte each, so the host can pace itself and count what went
+// wrong without a second endpoint:
+//   'K'  a frame has finished painting
+//   'O'  audio arrived faster than it could be played, and was dropped
+//   'U'  audio ran dry and silence was played instead
+#define MAGIC_LEN 4
+static const char MAGIC_VIDEO[MAGIC_LEN] = { 'T', 'F', 'T', '1' };
+static const char MAGIC_PCM[MAGIC_LEN]   = { 'P', 'C', 'M', '1' };
 
-#define FRAME_ACK 'K'
+// A single audio chunk should be short enough that it never delays a frame for
+// long: 1 KB is 23 ms of audio and 2 ms of bus time.
+#define AUDIO_CHUNK_MAX 4096
+
+typedef enum { RX_MAGIC, RX_LENGTH, RX_VIDEO, RX_AUDIO } rx_state_t;
+
+#define FRAME_ACK    'K'
+#define AUDIO_OVERFLOW_ACK 'O'
+#define AUDIO_UNDERRUN_ACK 'U'
 
 // 22.05 kHz mono, half of CD rate.  A one inch speaker does not reproduce the
 // 11 kHz this leaves, and as IMA ADPCM it costs 2.1% of a bus that video has
@@ -166,6 +181,13 @@ static void draw_splash(void) {
     cs_high();
 }
 
+static void bare_fill(uint16_t color) {
+    cs_low();
+    set_full_window();
+    for (uint32_t i = 0; i < TFT_WIDTH * TFT_HEIGHT; i++) st_data16(color);
+    cs_high();
+}
+
 // Hand a completed framebuffer to DMA and return immediately.  CS stays
 // asserted for the whole transfer and is released in display_poll().
 static void display_start(const uint8_t *pixels) {
@@ -197,11 +219,28 @@ static void display_poll(void) {
     ack_pending = true;
 }
 
+// Audio faults are reported as one byte per event rather than as a counter the
+// host has to ask for, so an underrun ends up in the sender's summary line
+// instead of being something you hear and guess at.
+static uint32_t reported_underruns = 0;
+static uint32_t reported_overflows = 0;
+
 static void service_ack(void) {
-    if (!ack_pending || tud_cdc_write_available() == 0) return;
-    tud_cdc_write_char(FRAME_ACK);
+    if (tud_cdc_write_available() == 0) return;
+
+    if (ack_pending) {
+        tud_cdc_write_char(FRAME_ACK);
+        ack_pending = false;
+    }
+    if (audio_underruns() != reported_underruns) {
+        reported_underruns++;
+        tud_cdc_write_char(AUDIO_UNDERRUN_ACK);
+    }
+    if (audio_overflows() != reported_overflows) {
+        reported_overflows++;
+        tud_cdc_write_char(AUDIO_OVERFLOW_ACK);
+    }
     tud_cdc_write_flush();
-    ack_pending = false;
 }
 
 // Opening the port at 1200 baud reboots into BOOTSEL, the same convention the
@@ -271,6 +310,19 @@ int main(void) {
     // Milestone 1: prove the clock, the wiring, the amp and the speaker with
     // nothing else in the path.  USB audio does not exist yet.
     audio_set_source(audio_test_tone);
+
+    // A receiver fed the wrong frame format buzzes rather than going silent, so
+    // all four are swept, four seconds each, and the panel says which one is
+    // live.  Same trick as painting the screen red and green during the USB
+    // bring-up: there is no serial console to print to.
+    static const uint16_t format_colour[AUDIO_FMT_COUNT] = {
+        0xF800,  // AUDIO_FMT_I2S      red
+        0x07E0,  // AUDIO_FMT_I2S_INV  green
+        0x001F,  // AUDIO_FMT_LJ       blue
+        0xFFFF,  // AUDIO_FMT_LJ_INV   white
+    };
+    uint32_t tone_format = 0;
+    uint32_t tone_switch_us = time_us_32();
 #endif
 
     tusb_rhport_init_t usb_init = {
@@ -279,47 +331,112 @@ int main(void) {
     };
     tusb_init(0, &usb_init); // RP2040's built-in USB controller
 
-    uint8_t header_matched = 0;
-    uint32_t frame_pos = 0;
+    rx_state_t rx_state = RX_MAGIC;
+    char magic_window[MAGIC_LEN] = { 0 };
+    bool want_video = false;
+    uint32_t payload_len = 0;
+    uint32_t payload_pos = 0;
+    uint8_t length_bytes = 0;
     uint8_t fill_index = 0;
+    uint8_t audio_scratch[256];
+
+#if !AUDIO_TEST_TONE
+    audio_set_source(audio_ring_source);
+#endif
 
     while (true) {
         tud_task();
         display_poll();
         service_ack();
+        audio_poll();
+
+#if AUDIO_TEST_TONE
+        if (time_us_32() - tone_switch_us >= 4u * 1000000u) {
+            tone_switch_us = time_us_32();
+            audio_set_format((audio_format_t) tone_format);
+            bare_fill(format_colour[tone_format]);
+            tone_format = (tone_format + 1) % AUDIO_FMT_COUNT;
+        }
+#endif
 
         while (tud_cdc_available()) {
-            if (header_matched < sizeof(frame_header)) {
+            if (rx_state == RX_MAGIC) {
+                // Slide a four byte window along the stream.  Scanning rather
+                // than counting is what lets the reader recover on its own,
+                // and it costs one byte-at-a-time read per header.
                 uint8_t byte;
                 tud_cdc_read(&byte, 1);
-                if (byte == frame_header[header_matched]) {
-                    header_matched++;
+                magic_window[0] = magic_window[1];
+                magic_window[1] = magic_window[2];
+                magic_window[2] = magic_window[3];
+                magic_window[3] = (char) byte;
+
+                if (memcmp(magic_window, MAGIC_VIDEO, MAGIC_LEN) == 0) {
+                    want_video = true;
+                } else if (memcmp(magic_window, MAGIC_PCM, MAGIC_LEN) == 0) {
+                    want_video = false;
                 } else {
-                    // The first header byte can also begin a new header.
-                    header_matched = (byte == frame_header[0]) ? 1 : 0;
+                    continue;
                 }
+                rx_state = RX_LENGTH;
+                payload_len = 0;
+                length_bytes = 0;
                 continue;
             }
 
-            // Bulk-copy whatever has arrived straight into the framebuffer.
-            uint32_t got = tud_cdc_read(&frame_buf[fill_index][frame_pos],
-                                       FRAME_BYTES - frame_pos);
-            if (got == 0) break;
-            frame_pos += got;
+            if (rx_state == RX_LENGTH) {
+                uint8_t byte;
+                tud_cdc_read(&byte, 1);
+                payload_len = (payload_len << 8) | byte;
+                if (++length_bytes < 4) continue;
 
-            if (frame_pos == FRAME_BYTES) {
+                // A length the firmware cannot honour means the magic was a
+                // coincidence in the middle of a payload, so go back to
+                // scanning instead of trusting it.
+                uint32_t limit = want_video ? FRAME_BYTES : AUDIO_CHUNK_MAX;
+                bool sane = want_video ? (payload_len == FRAME_BYTES)
+                                       : (payload_len > 0 && payload_len <= limit);
+                if (!sane) {
+                    rx_state = RX_MAGIC;
+                    continue;
+                }
+                rx_state = want_video ? RX_VIDEO : RX_AUDIO;
+                payload_pos = 0;
+                continue;
+            }
+
+            if (rx_state == RX_VIDEO) {
+                // Bulk-copy whatever has arrived straight into the framebuffer.
+                uint32_t got = tud_cdc_read(&frame_buf[fill_index][payload_pos],
+                                            payload_len - payload_pos);
+                if (got == 0) break;
+                payload_pos += got;
+                if (payload_pos < payload_len) continue;
+
                 // The previous frame is normally long gone (8.4 ms of DMA
                 // against ~28 ms of USB), but never overwrite a buffer that
-                // is still being shifted out.
+                // is still being shifted out.  Audio keeps running here: it is
+                // fed by its own DMA and refilled from an interrupt.
                 while (dma_busy) {
                     tud_task();
                     display_poll();
                 }
                 display_start(frame_buf[fill_index]);
                 fill_index ^= 1;
-                frame_pos = 0;
-                header_matched = 0;
+                rx_state = RX_MAGIC;
+                continue;
             }
+
+            // RX_AUDIO.  Small reads, because these bytes are copied into the
+            // ring rather than landing in their final place, and because a
+            // long audio chunk must not hold up tud_task().
+            uint32_t want = payload_len - payload_pos;
+            if (want > sizeof(audio_scratch)) want = sizeof(audio_scratch);
+            uint32_t got = tud_cdc_read(audio_scratch, want);
+            if (got == 0) break;
+            payload_pos += got;
+            audio_push(audio_scratch, got);
+            if (payload_pos == payload_len) rx_state = RX_MAGIC;
         }
     }
 }

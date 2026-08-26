@@ -35,6 +35,34 @@ public entry_point:
     set x, 14               side 0b01
 .wrap
 
+; Left-justified is the same clocking with LRCLK moved: it changes in step with
+; the channel's first bit instead of one bit early.  Amplifiers disagree about
+; which they want, and the two sound different in a specific way: feed a
+; left-justified receiver an I2S stream and every sample is shifted one bit, so
+; the MSB of one channel lands in the LSB of the other and the result buzzes
+; rather than going silent.  Having both means the question is settled by
+; listening once instead of by reading two datasheets.
+
+.program lj_out
+.side_set 2
+
+.wrap_target
+    ; --- left channel, LRCLK low, first bit in step with the transition ---
+left_bits:
+    out pins, 1             side 0b00
+    jmp x-- left_bits       side 0b01
+    out pins, 1             side 0b00
+    set x, 14               side 0b01
+
+    ; --- right channel, LRCLK high ---
+right_bits:
+    out pins, 1             side 0b10
+    jmp x-- right_bits      side 0b11
+    out pins, 1             side 0b10
+public entry_point:
+    set x, 14               side 0b11
+.wrap
+
 % c-sdk {
 #include "hardware/clocks.h"
 
@@ -42,14 +70,16 @@ public entry_point:
 // because the two share one side-set field.
 static inline void i2s_out_program_init(PIO pio, uint sm, uint offset,
                                         uint data_pin, uint clock_pin_base,
-                                        uint32_t sample_rate) {
+                                        uint32_t sample_rate,
+                                        bool left_justified) {
     pio_gpio_init(pio, data_pin);
     pio_gpio_init(pio, clock_pin_base);
     pio_gpio_init(pio, clock_pin_base + 1);
     pio_sm_set_consecutive_pindirs(pio, sm, data_pin, 1, true);
     pio_sm_set_consecutive_pindirs(pio, sm, clock_pin_base, 2, true);
 
-    pio_sm_config c = i2s_out_program_get_default_config(offset);
+    pio_sm_config c = left_justified ? lj_out_program_get_default_config(offset)
+                                     : i2s_out_program_get_default_config(offset);
     sm_config_set_out_pins(&c, data_pin, 1);
     sm_config_set_sideset_pins(&c, clock_pin_base);
 
@@ -62,7 +92,8 @@ static inline void i2s_out_program_init(PIO pio, uint sm, uint offset,
     // divider's 8 fractional bits land within 0.0012% of the target.
     sm_config_set_clkdiv(&c, (float) clock_get_hz(clk_sys) / (sample_rate * 64.0f));
 
-    pio_sm_init(pio, sm, offset + i2s_out_offset_entry_point, &c);
+    pio_sm_init(pio, sm, offset + (left_justified ? lj_out_offset_entry_point
+                                                  : i2s_out_offset_entry_point), &c);
     pio_sm_set_enabled(pio, sm, true);
 }
 %}
